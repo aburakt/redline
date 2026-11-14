@@ -1,7 +1,10 @@
 name: ci
+# main and PRs only: work-in-progress branch pushes don't run (or notify).
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 jobs:
   test:
     strategy:
