@@ -1,0 +1,14 @@
+{
+  "name": "redline",
+  "description": "redline: machine-aware hooks for AI coding agents.",
+  "owner": {
+    "name": "aburakt"
+  },
+  "plugins": [
+    {
+      "name": "redline",
+      "source": "./",
+      "description": "Machine-aware hooks: session briefing on RAM/disk/devices, advice or a stop before heavy shell commands."
+    }
+  ]
+}

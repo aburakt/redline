@@ -1,0 +1,11 @@
+{
+  "description": "redline: brief the agent on machine state, steer heavy or blocking shell commands",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/redline\" hook claude start", "timeout": 10 }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/redline\" hook claude pre", "timeout": 10 }] }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+## Machine resources (redline)
+
+- Before booting a simulator/emulator, a Gradle build, containers or a dev server, run
+  `~/.redline/bin/redline status`. If memory shows WARN or CRITICAL, free memory or ask first.
+- One simulator/emulator at a time. Reuse booted devices and running dev servers.
+- Stop what you start when you're done (`xcrun simctl shutdown all`, `adb emu kill`,
+  `./gradlew --stop`, `docker compose down`). Say what you left running.
+- Never run watch mode or interactive commands in the foreground (`--watch`, `vim`, `less`,
+  `git rebase -i`): use the run-once / non-interactive form.
+- Never kill something you didn't start without asking.

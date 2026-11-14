@@ -1,0 +1,5 @@
+ios-sim	CoreSimulator|simruntime|Simulator\.app	xcrun simctl shutdown all
+android-emu	qemu-system.*(-avd|android)|/emulator/emulator	adb emu kill
+gradle	GradleDaemon	./gradlew --stop
+vm	com\.apple\.Virtualization|com\.docker\.|qemu-system|vmmem|colima|lima	stop the VM/container runtime
+dev-server	vite|next dev|next-server|metro|webpack|astro dev|expo start	stop unused dev servers

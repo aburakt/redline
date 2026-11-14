@@ -1,0 +1,10 @@
+{
+  "name": "redline",
+  "version": "0.1.0",
+  "description": "Tells the agent what the machine can take: briefs on RAM, disk and running devices at session start, steers heavy or blocking shell commands.",
+  "author": { "name": "Ahmet Burak Tekin", "url": "https://aburakt.com" },
+  "homepage": "https://github.com/aburakt/redline",
+  "repository": "https://github.com/aburakt/redline",
+  "license": "MIT",
+  "keywords": ["resources", "memory", "simulator", "hooks", "developer-tools"]
+}

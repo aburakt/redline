@@ -1,0 +1,373 @@
+#!/bin/sh
+# redline — tells AI coding agents what the machine can take.
+# POSIX sh, no dependencies. Windows: dispatches to redline.ps1.
+#   redline status [--json]     one-line briefing (or JSON)
+#   redline check -- <command>  ok | advise | deny (+ message)
+#   redline hook <agent> <event>  agent hook adapter (stdin JSON -> stdout JSON)
+#   redline probe               refresh the metrics cache
+set -u
+
+case "$0" in */*) SELF_DIR=${0%/*} ;; *) SELF_DIR=. ;; esac
+ROOT=$(cd "$SELF_DIR/.." 2>/dev/null && pwd) || ROOT=..
+SELF="$ROOT/bin/redline"
+RULES_DIR="$ROOT/rules"
+
+case "${REDLINE_FAKE_UNAME:-$(uname -s 2>/dev/null)}" in
+  MINGW* | MSYS* | CYGWIN*)
+    exec powershell -NoProfile -ExecutionPolicy Bypass -File "$ROOT/bin/redline.ps1" "$@" ;;
+esac
+
+TTL=${REDLINE_TTL:-10}
+MEM_WARN=${REDLINE_MEM_WARN_PCT:-25}
+MEM_CRIT=${REDLINE_MEM_CRIT_PCT:-10}
+DISK_WARN=${REDLINE_DISK_WARN_GB:-10}
+DISK_CRIT=${REDLINE_DISK_CRIT_GB:-3}
+CPU_WARN=${REDLINE_CPU_WARN:-2}
+PORTS_SCAN="3000 3001 4321 5173 8000 8080 8081 8787 19000"
+
+cache_dir() {
+  if [ -n "${REDLINE_CACHE_DIR:-}" ]; then printf '%s' "$REDLINE_CACHE_DIR"
+  else printf '%s/redline' "${XDG_CACHE_HOME:-$HOME/.cache}"; fi
+}
+
+# Prints the cache dir if it is safe to use: a real directory (not a symlink) owned by us.
+# Never a shared /tmp path: anyone could pre-create it and feed us metrics.
+safe_cache_dir() {
+  d=$(cache_dir)
+  [ -L "$d" ] && return 1
+  if [ ! -d "$d" ]; then mkdir -p "${d%/*}" 2>/dev/null; (umask 077 && mkdir "$d") 2>/dev/null; fi
+  [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && [ -w "$d" ] || return 1
+  printf '%s' "$d"
+}
+
+# Only well-formed key=value lines pass. Cache and probe output are data, never trusted text:
+# nothing outside these shapes can reach the agent's context.
+sanitize() {
+  awk -F'=' '{
+    k = $1; v = substr($0, length(k) + 2); ok = 0
+    if (k == "mem_avail_pct" || k == "ts") ok = v ~ /^[0-9]+$/
+    else if (k == "pressure") ok = v ~ /^(normal|warn|critical)$/
+    else if (k == "swap_gb" || k == "disk_free_gb" || k == "load_per_core") ok = v ~ /^[0-9]+(\.[0-9]+)?$/
+    else if (k == "procs") ok = v ~ /^([a-z-]+:[0-9]+(,[a-z-]+:[0-9]+)*)?$/
+    else if (k == "ports") ok = v ~ /^([0-9]+(,[0-9]+)*)?$/
+    if (ok) print k "=" v
+  }'
+}
+
+# ---------- probing (writes key=value lines to stdout) ----------
+
+probe_procs() {
+  # sum RSS (KB) per group; first matching group wins
+  ps axo rss=,command= 2>/dev/null | awk -F'\t' -v groups="$RULES_DIR/groups.tsv" '
+    BEGIN { n = 0; while ((getline line < groups) > 0) { split(line, f, "\t"); if (f[1] != "") { n++; g[n] = f[1]; re[n] = f[2] } } }
+    {
+      rss = $0; sub(/^ */, "", rss); cmd = rss; sub(/ .*/, "", rss); sub(/^[0-9]+ +/, "", cmd)
+      for (i = 1; i <= n; i++) if (cmd ~ re[i]) { kb[g[i]] += rss; break }
+    }
+    END { s = ""; for (i = 1; i <= n; i++) if (kb[g[i]] > 0) { s = s (s == "" ? "" : ",") g[i] ":" int(kb[g[i]] / 1024) } print "procs=" s }'
+}
+
+probe_ports() {
+  {
+    if command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }'
+    elif command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{ print $4 }'
+    elif command -v netstat >/dev/null 2>&1; then netstat -ltn 2>/dev/null | awk '{ print $4 }'
+    fi
+  } | awk -v scan="$PORTS_SCAN" '
+    BEGIN { n = split(scan, s, " "); for (i = 1; i <= n; i++) want[s[i]] = 1 }
+    { p = $0; sub(/.*[:.]/, "", p); if (p in want && !(p in seen)) { seen[p] = 1; out[++k] = p } }
+    END { for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++) if (out[j] + 0 < out[i] + 0) { t = out[i]; out[i] = out[j]; out[j] = t }
+          s = ""; for (i = 1; i <= k; i++) s = s (s == "" ? "" : ",") out[i]; print "ports=" s }'
+}
+
+probe_all() {
+  os=$(uname -s 2>/dev/null)
+  cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  case "$os" in
+    Darwin)
+      v=$(sysctl -n kern.memorystatus_level 2>/dev/null) && echo "mem_avail_pct=$v"
+      case "$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)" in
+        4) echo "pressure=critical" ;; 2) echo "pressure=warn" ;; *) echo "pressure=normal" ;;
+      esac
+      sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "used") { v = $(i + 2); sub(/M/, "", v); printf "swap_gb=%.1f\n", v / 1024 } }'
+      sysctl -n vm.loadavg 2>/dev/null | awk -v c="$cores" '{ printf "load_per_core=%.1f\n", $2 / c }'
+      ;;
+    Linux)
+      awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } /^SwapTotal:/ { st = $2 } /^SwapFree:/ { sf = $2 }
+           END { if (t > 0) printf "mem_avail_pct=%d\n", a * 100 / t; printf "swap_gb=%.1f\n", (st - sf) / 1048576 }' /proc/meminfo 2>/dev/null
+      if [ -r /proc/pressure/memory ]; then
+        awk -v w=20 '{ split($2, a, "="); v[$1] = a[2] }
+          END { if (v["full"] + 0 >= w) print "pressure=critical"; else if (v["some"] + 0 >= w) print "pressure=warn"; else print "pressure=normal" }' /proc/pressure/memory
+      else echo "pressure=normal"; fi
+      awk -v c="$cores" '{ printf "load_per_core=%.1f\n", $1 / c }' /proc/loadavg 2>/dev/null
+      ;;
+  esac
+  df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { printf "disk_free_gb=%d\n", $4 / 1048576 }'
+  probe_procs
+  probe_ports
+  echo "ts=$(date +%s)"
+}
+
+has_fakes() { env | grep -q '^REDLINE_FAKE_'; }
+
+fake_metrics() {
+  [ -n "${REDLINE_FAKE_MEM_AVAIL_PCT:-}" ] && echo "mem_avail_pct=$REDLINE_FAKE_MEM_AVAIL_PCT"
+  echo "pressure=${REDLINE_FAKE_PRESSURE:-normal}"
+  [ -n "${REDLINE_FAKE_SWAP_GB:-}" ] && echo "swap_gb=$REDLINE_FAKE_SWAP_GB"
+  [ -n "${REDLINE_FAKE_DISK_FREE_GB:-}" ] && echo "disk_free_gb=$REDLINE_FAKE_DISK_FREE_GB"
+  [ -n "${REDLINE_FAKE_LOAD_PER_CORE:-}" ] && echo "load_per_core=$REDLINE_FAKE_LOAD_PER_CORE"
+  echo "procs=${REDLINE_FAKE_PROCS:-}"
+  echo "ports=${REDLINE_FAKE_PORTS:-}"
+  return 0
+}
+
+write_cache() {
+  dir=$(safe_cache_dir) || return 1
+  tmp="$dir/metrics.$$"
+  probe_all > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/metrics" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  rmdir "$dir/lock" 2>/dev/null
+  return 0
+}
+
+# Prints metrics as key=value. Stale cache is served while a background refresh runs.
+metrics() { raw_metrics | sanitize; }
+
+raw_metrics() {
+  if has_fakes; then fake_metrics; return; fi
+  dir=$(safe_cache_dir) || { probe_all; return; }
+  f="$dir/metrics"
+  if [ -r "$f" ]; then
+    now=$(date +%s); ts=$(sed -n 's/^ts=//p' "$f" | head -n 1)
+    case "$ts" in '' | *[!0-9]*) ts=0 ;; esac
+    case "$TTL" in '' | *[!0-9]*) TTL=10 ;; esac
+    if [ $((now - ts)) -gt "$TTL" ]; then
+      # a probe killed mid-run (sleep, timeout) leaves its lock; break locks older than a minute
+      [ -d "$dir/lock" ] && [ -n "$(find "$dir/lock" -prune -mmin +1 2>/dev/null)" ] && rmdir "$dir/lock" 2>/dev/null
+      mkdir "$dir/lock" 2>/dev/null && ( sh "$SELF" probe >/dev/null 2>&1 & )
+    fi
+    cat "$f"
+  elif write_cache && [ -r "$f" ]; then cat "$f"
+  else probe_all
+  fi
+}
+
+# ---------- evaluation (key=value metrics -> derived state on stdout) ----------
+
+# Emits: mem_level disk_level cpu_level plus "heavy=<group:mb:free;...>" sorted desc, >= 300 MB.
+evaluate() {
+  awk -F'=' -v mw="$MEM_WARN" -v mc="$MEM_CRIT" -v dw="$DISK_WARN" -v dc="$DISK_CRIT" -v cw="$CPU_WARN" \
+      -v groups="$RULES_DIR/groups.tsv" '
+    BEGIN { while ((getline line < groups) > 0) { split(line, f, "\t"); free[f[1]] = f[3] } }
+    { k = $1; v = substr($0, length(k) + 2); m[k] = v; have[k] = 1 }
+    END {
+      for (k in m) print k "=" m[k]
+      if (have["mem_avail_pct"]) {
+        a = m["mem_avail_pct"] + 0; p = m["pressure"]
+        l = (a < mc || p == "critical") ? "critical" : (a < mw || p == "warn") ? "warn" : "ok"
+        print "mem_level=" l
+      }
+      if (have["disk_free_gb"]) { d = m["disk_free_gb"] + 0; print "disk_level=" (d < dc ? "critical" : d < dw ? "warn" : "ok") }
+      if (have["load_per_core"]) print "cpu_level=" (m["load_per_core"] + 0 >= cw ? "warn" : "ok")
+      n = split(m["procs"], ps, ","); k2 = 0
+      for (i = 1; i <= n; i++) { split(ps[i], gm, ":"); if (gm[2] + 0 >= 300) { k2++; gg[k2] = gm[1]; mb[k2] = gm[2] + 0 } }
+      for (i = 1; i <= k2; i++) for (j = i + 1; j <= k2; j++) if (mb[j] > mb[i]) { t = mb[i]; mb[i] = mb[j]; mb[j] = t; t = gg[i]; gg[i] = gg[j]; gg[j] = t }
+      s = ""; for (i = 1; i <= k2; i++) s = s (s == "" ? "" : ";") gg[i] ":" mb[i] ":" free[gg[i]]
+      print "heavy=" s
+    }'
+}
+
+state() { metrics | evaluate; }
+
+# ---------- status ----------
+
+status_json() {
+  state | awk -F'=' '
+    { k = $1; v = substr($0, length(k) + 2); m[k] = v; have[k] = 1 }
+    function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    END {
+      o = ""
+      if (have["mem_avail_pct"]) o = o "\"mem\":{\"avail_pct\":" (m["mem_avail_pct"] + 0) ",\"level\":\"" m["mem_level"] "\"},"
+      if (have["swap_gb"]) o = o "\"swap_gb\":" m["swap_gb"] ","
+      if (have["disk_free_gb"]) o = o "\"disk\":{\"free_gb\":" (m["disk_free_gb"] + 0) ",\"level\":\"" m["disk_level"] "\"},"
+      if (have["load_per_core"]) o = o "\"cpu\":{\"load_per_core\":" m["load_per_core"] ",\"level\":\"" m["cpu_level"] "\"},"
+      h = ""; n = split(m["heavy"], hs, ";")
+      for (i = 1; i <= n; i++) { split(hs[i], f, ":"); h = h (h == "" ? "" : ",") "{\"group\":\"" esc(f[1]) "\",\"mb\":" f[2] ",\"free\":\"" esc(f[3]) "\"}" }
+      o = o "\"heavy\":[" h "],\"ports\":[" m["ports"] "]"
+      print "{" o "}"
+    }'
+}
+
+status_line() {
+  state | awk -F'=' '
+    { k = $1; v = substr($0, length(k) + 2); m[k] = v; have[k] = 1 }
+    function tag(l) { return l == "warn" ? " (WARN)" : l == "critical" ? " (CRITICAL)" : "" }
+    function add(s) { o = o (o == "" ? "" : " · ") s }
+    END {
+      o = ""
+      if (have["mem_avail_pct"]) add("mem " (m["mem_avail_pct"] + 0) "% free" tag(m["mem_level"]))
+      if (have["swap_gb"]) add("swap " m["swap_gb"] "G")
+      if (have["disk_free_gb"]) add("disk " (m["disk_free_gb"] + 0) "G free" tag(m["disk_level"]))
+      if (m["cpu_level"] == "warn") add(sprintf("load %.1f/core (WARN)", m["load_per_core"]))
+      if (m["heavy"] == "") add("nothing heavy running")
+      else { h = ""; n = split(m["heavy"], hs, ";"); for (i = 1; i <= n; i++) { split(hs[i], f, ":"); h = h (h == "" ? "" : ", ") f[1] " " sprintf("%.1f", f[2] / 1000) "G" } add("heavy: " h) }
+      if (m["ports"] != "") add("ports " m["ports"])
+      print "redline: " o
+    }'
+}
+
+# ---------- check ----------
+
+# check <command>: prints "ok", or "advise"/"deny" followed by the message line.
+check_cmd() {
+  [ "$OFF" = 1 ] && { echo ok; return 0; }
+  state | REDLINE_CMD="$1" awk -F'=' -v rules="$RULES_DIR/rules.tsv" '
+    { k = $1; v = substr($0, length(k) + 2); m[k] = v }
+    function bad(l) { return l == "warn" || l == "critical" }
+    function addsum(s) { if (!(s in seen)) { seen[s] = 1; sum = sum (sum == "" ? "" : "; ") s } }
+    function pressure_summary() {
+      if (bad(m["mem_level"])) addsum("memory " m["mem_level"] ", " (m["mem_avail_pct"] + 0) "% free")
+      if (bad(m["disk_level"])) addsum("disk " m["disk_level"] ", " (m["disk_free_gb"] + 0) "G free")
+      if (m["cpu_level"] == "warn") addsum(sprintf("load %.1f/core", m["load_per_core"]))
+      if (m["heavy"] != "") { split(m["heavy"], hs, ";"); split(hs[1], f, ":"); addsum(sprintf("top: %s %.1fG (free: %s)", f[1], f[2] / 1000, f[3])) }
+    }
+    function running(g,   n, i, hs, f) { n = split(m["heavy"], hs, ";"); for (i = 1; i <= n; i++) { split(hs[i], f, ":"); if (f[1] == g) return 1 } return 0 }
+    END {
+      cmd = ENVIRON["REDLINE_CMD"]; verdict = 0; adv = ""; sum = ""
+      while ((getline line < rules) > 0) {
+        n = split(line, r, "\t"); if (n < 4 || cmd !~ r[3]) continue
+        when = r[2]; hit = 0
+        if (when == "always") hit = 1
+        else if (when ~ /^running:/) { g = substr(when, 9); if (running(g)) hit = 1 }
+        else if (when == "ports") { if (m["ports"] != "") { hit = 1; addsum("listening: " m["ports"]) } }
+        else if (when == "pressure") {
+          if (m["mem_level"] == "critical" || m["disk_level"] == "critical") hit = 2
+          else if (bad(m["mem_level"]) || bad(m["disk_level"]) || m["cpu_level"] == "warn") hit = 1
+          if (hit) pressure_summary()
+        } else if (when == "disk") {
+          if (m["disk_level"] == "critical") hit = 2; else if (m["disk_level"] == "warn") hit = 1
+          if (hit) addsum("disk " m["disk_level"] ", " (m["disk_free_gb"] + 0) "G free")
+        }
+        if (!hit) continue
+        if (hit > verdict) verdict = hit
+        if (!(r[4] in said)) { said[r[4]] = 1; adv = adv (adv == "" ? "" : " | ") r[4] }
+      }
+      if (verdict == 0) { print "ok"; exit }
+      print (verdict == 2 ? "deny" : "advise")
+      print "redline: " (sum == "" ? "" : sum ". ") adv
+    }'
+}
+
+# ---------- hooks ----------
+
+# JSON string literal (with quotes) of $1.
+jstr() {
+  printf '%s' "$1" | awk 'BEGIN { RS = "\001" } { buf = buf $0 } END {
+    out = ""; n = length(buf)
+    for (i = 1; i <= n; i++) { c = substr(buf, i, 1)
+      if (c == "\\") out = out "\\\\"; else if (c == "\"") out = out "\\\""
+      else if (c == "\n") out = out "\\n"; else if (c == "\t") out = out "\\t"; else if (c == "\r") out = out "\\r"
+      else out = out c }
+    printf "\"%s\"", out }'
+}
+
+# Command string from an agent payload on stdin: first "command" value; also handles a
+# JSON-string-encoded args object (Copilot toolArgs). Never falls back to the raw payload.
+extract_cmd() {
+  awk 'BEGIN { RS = "\001" } { buf = buf $0 }
+    function getcmd(s,   rest, out, ch, e, j, n) {
+      if (!match(s, /"command"[ \t\r\n]*:[ \t\r\n]*"/)) return ""
+      rest = substr(s, RSTART + RLENGTH); out = ""; n = length(rest); if (n > 8000) n = 8000
+      for (j = 1; j <= n; j++) { ch = substr(rest, j, 1)
+        if (ch == "\\") { j++; e = substr(rest, j, 1)
+          if (e == "n") out = out "\n"; else if (e == "t") out = out "\t"; else if (e == "r") out = out ""
+          else if (e == "u") { j += 4; out = out "?" } else out = out e }
+        else if (ch == "\"") return out
+        else out = out ch }
+      return out
+    }
+    function unesc(s,   out, ch, j, n) {
+      out = ""; n = length(s)
+      for (j = 1; j <= n; j++) { ch = substr(s, j, 1)
+        if (ch == "\\" && j < n) { j++; ch = substr(s, j, 1); if (ch == "n") ch = "\n"; else if (ch == "t") ch = "\t" }
+        out = out ch }
+      return out
+    }
+    END {
+      c = getcmd(buf)
+      if (c == "" && index(buf, "\\\"command\\\"")) c = getcmd(unesc(buf))
+      printf "%s", substr(c, 1, 4000)
+    }'
+}
+
+ok_out() { [ "$1" = cursor ] && [ "$2" = pre ] && printf '{"permission":"allow"}'; return 0; }
+
+hook_impl() {
+  agent=$1; ev=$2
+  case "$agent" in claude | codex | cursor | gemini | copilot) ;; *) return 1 ;; esac
+  case "$ev" in
+    start)
+      cat >/dev/null
+      [ "$OFF" = 1 ] && return 0
+      l=$(jstr "$(status_line)")
+      case "$agent" in
+        cursor) printf '{"additional_context":%s}' "$l" ;;
+        copilot) printf '{"additionalContext":%s}' "$l" ;;
+        *) printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}' "$l" ;;
+      esac ;;
+    pre)
+      c=$(extract_cmd)
+      [ -z "$c" ] && { ok_out "$agent" pre; return 0; }
+      res=$(check_cmd "$c")
+      verdict=$(printf '%s\n' "$res" | sed -n 1p)
+      msg=$(printf '%s\n' "$res" | sed -n 2p)
+      m=$(jstr "$msg")
+      case "$verdict" in
+        advise)
+          case "$agent" in
+            claude | codex) printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":%s}}' "$m" ;;
+            cursor) printf '{"permission":"allow","agent_message":%s}' "$m" ;;
+            gemini) d=$(safe_cache_dir) && printf '%s' "$msg" > "$d/pending-gemini" ;;
+            copilot) ;;
+          esac ;;
+        deny)
+          case "$agent" in
+            claude | codex) printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}' "$m" ;;
+            cursor) printf '{"permission":"deny","user_message":%s,"agent_message":%s}' "$m" "$m" ;;
+            gemini) printf '{"decision":"deny","reason":%s}' "$m" ;;
+            copilot) printf '{"permissionDecision":"deny","permissionDecisionReason":%s}' "$m" ;;
+          esac ;;
+        *) ok_out "$agent" pre ;;
+      esac ;;
+    post)
+      cat >/dev/null
+      f="$(safe_cache_dir)/pending-gemini"
+      if [ "$agent" = gemini ] && [ -r "$f" ]; then
+        m=$(jstr "$(cat "$f")"); rm -f "$f"
+        printf '{"hookSpecificOutput":{"hookEventName":"AfterTool","additionalContext":%s}}' "$m"
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- main ----------
+
+[ "${REDLINE:-}" = "off" ] && OFF=1 || OFF=0
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  probe) write_cache ;;
+  status)
+    [ "$OFF" = 1 ] && exit 0
+    if [ "${1:-}" = "--json" ]; then status_json; else status_line; fi ;;
+  hook)
+    agent=${1:-}; ev=${2:-}
+    out=$(hook_impl "$agent" "$ev" 2>/dev/null) || out=$(ok_out "$agent" "$ev")
+    [ -n "$out" ] && printf '%s\n' "$out"
+    exit 0 ;;
+  check)
+    [ "${1:-}" = "--" ] && shift
+    check_cmd "$*" ;;
+  *) echo "usage: redline status [--json] | check -- <command> | hook <agent> <event> | probe" >&2; exit 64 ;;
+esac
